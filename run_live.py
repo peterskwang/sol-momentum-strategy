@@ -1,307 +1,113 @@
-"""
-run_live.py — Main Entry Point for SOL Regime-Filtered ATR Momentum Strategy
-
-Usage:
-    python run_live.py              # paper mode (default)
-    python run_live.py --live       # live trading (LIVE_TRADING=true also required)
-    python run_live.py --testnet    # use Binance testnet
-    python run_live.py --log-level DEBUG
-
-CRITICAL: Paper mode is the default. Live trading requires BOTH:
-    1. LIVE_TRADING=true environment variable
-    2. --live CLI flag
-"""
+"""Live execution entry point for the SOL regime-filtered momentum strategy."""
+from __future__ import annotations
 
 import argparse
-import logging
-import os
-import sys
-import time
 import json
-from datetime import datetime, timezone
+import logging
+import threading
+import time
+from pathlib import Path
+from typing import Any
 
-from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
+from websocket import WebSocketApp
 
-# ---------------------------------------------------------------------------
-# Load .env before importing config
-# ---------------------------------------------------------------------------
-load_dotenv()
-load_dotenv("secrets/binance_sol_strategy.env")
+from config import MAX_LEVERAGE, SYMBOLS, load_config
+from execution.binance_client import create_client, setup_futures_leverage
+from strategy.portfolio import Portfolio
+from strategy.regime_filter import update_regime
+
+STATE_PATH = Path("state/strategy_state.json")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="SOL Regime-Filtered ATR Momentum Strategy")
-    parser.add_argument("--live", action="store_true", help="Enable live trading (requires LIVE_TRADING=true env var)")
-    parser.add_argument("--testnet", action="store_true", help="Use Binance testnet")
-    parser.add_argument(
-        "--log-level",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Logging level",
-    )
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run SOL regime momentum live loop")
+    parser.add_argument("--live", action="store_true", help="Enable live trading (requires env flag)")
+    parser.add_argument("--testnet", action="store_true", help="Use Binance Futures testnet")
+    parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser.parse_args()
 
 
-def setup_logging(log_level: str, log_file: str):
-    """Configure logging to both console and file."""
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-
-    fmt = "%(asctime)s UTC | %(levelname)s | %(name)s | %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
-
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(log_file, encoding="utf-8"),
-    ]
-
-    logging.basicConfig(
-        level=getattr(logging, log_level),
-        format=fmt,
-        datefmt=datefmt,
-        handlers=handlers,
-    )
-
-    # Suppress noisy third-party loggers
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("binance").setLevel(logging.WARNING)
-    logging.getLogger("apscheduler").setLevel(logging.WARNING)
+def ensure_state_file() -> None:
+    if not STATE_PATH.exists():
+        STATE_PATH.write_text(json.dumps({
+            "version": "1.0",
+            "btc_regime": "BULL",
+            "open_positions": {},
+            "closed_trades": [],
+            "paper_mode": True,
+            "paper_equity": 10000.0,
+            "paper_pnl": 0.0,
+            "lot_size_cache": {},
+        }, indent=2))
 
 
-def main():
+def start_websocket(portfolio: Portfolio, btc_regime_getter) -> WebSocketApp:
+    streams = ["solusdt@kline_4h", "ethusdt@kline_4h", "avaxusdt@kline_4h"]
+    url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
+
+    def on_message(_: Any, message: str) -> None:
+        data = json.loads(message)
+        candle = data.get("data", {}).get("k", {})
+        if candle.get("x"):
+            regime = btc_regime_getter()
+            portfolio.run_signal_cycle(regime)
+            portfolio.run_exit_cycle()
+
+    ws_app = WebSocketApp(url, on_message=on_message)
+    thread = threading.Thread(target=ws_app.run_forever, daemon=True)
+    thread.start()
+    return ws_app
+
+
+def main() -> None:
     args = parse_args()
+    cfg = load_config()
 
-    from config import load_config, validate_config, LOG_FILE, STATE_FILE, SYMBOLS, MIN_LEVERAGE
-
-    config = load_config()
-    setup_logging(args.log_level, config["log_file"])
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
     logger = logging.getLogger("run_live")
 
-    # ---------------------------------------------------------------------------
-    # Determine trading mode — belt and suspenders
-    # ---------------------------------------------------------------------------
-    live_trading = args.live and (os.environ.get("LIVE_TRADING", "false").lower() == "true")
+    live_enabled = cfg.live_trading and args.live
+    paper_mode = not live_enabled
 
-    if args.live and not os.environ.get("LIVE_TRADING", "false").lower() == "true":
-        logger.error(
-            "❌  --live flag provided but LIVE_TRADING env var is not 'true'. "
-            "Both are required for live trading. Aborting."
-        )
-        sys.exit(1)
+    if live_enabled and (not cfg.api_key or not cfg.api_secret):
+        raise RuntimeError("Live trading requires API credentials")
 
-    if not args.live and os.environ.get("LIVE_TRADING", "false").lower() == "true":
-        logger.warning(
-            "⚠️  LIVE_TRADING=true is set but --live flag is missing. "
-            "Running in PAPER MODE. Add --live flag to enable live trading."
-        )
-        live_trading = False
+    mode_label = "LIVE" if live_enabled else "PAPER"
+    logger.info("Starting strategy in %s mode", mode_label)
 
-    config["live_trading"] = live_trading
-    testnet = args.testnet or config.get("testnet", False)
+    ensure_state_file()
 
-    # ---------------------------------------------------------------------------
-    # Display mode banner
-    # ---------------------------------------------------------------------------
-    if live_trading:
-        banner = "\n" + "=" * 60 + "\n🔴  LIVE TRADING MODE — REAL ORDERS WILL BE PLACED  🔴\n" + "=" * 60
-    else:
-        banner = "\n" + "=" * 60 + "\n⚠️   PAPER MODE ACTIVE — NO REAL ORDERS WILL BE PLACED  ⚠️\n" + "=" * 60
+    client = create_client(cfg.api_key, cfg.api_secret, testnet=args.testnet)
 
-    logger.info(banner)
-    print(banner)
+    for symbol in SYMBOLS:
+        setup_futures_leverage(client, symbol, int(MAX_LEVERAGE), logger=logger)
 
-    # ---------------------------------------------------------------------------
-    # Validate API keys
-    # ---------------------------------------------------------------------------
-    try:
-        validate_config(config, require_keys=True)
-    except EnvironmentError as exc:
-        logger.error("❌  Configuration error: %s", exc)
-        sys.exit(1)
+    portfolio = Portfolio(client=client, state_path=STATE_PATH, logger=logger, paper_mode=paper_mode)
 
-    # ---------------------------------------------------------------------------
-    # Create Binance client
-    # ---------------------------------------------------------------------------
-    from execution.binance_client import create_client, setup_futures_leverage
+    def refresh_regime() -> str:
+        state = portfolio.state
+        regime = update_regime(client, state, logger=logger)
+        portfolio._save_state()
+        return regime
 
-    try:
-        client = create_client(testnet=testnet)
-    except (EnvironmentError, ConnectionError) as exc:
-        logger.error("❌  Failed to create Binance client: %s", exc)
-        sys.exit(1)
-
-    # ---------------------------------------------------------------------------
-    # Load state
-    # ---------------------------------------------------------------------------
-    from state_manager import load_state, save_state
-
-    state = load_state(config["state_file"])
-    state["paper_mode"] = not live_trading
-    if not live_trading and state.get("paper_equity", 0) <= 0:
-        state["paper_equity"] = config["paper_initial_equity"]
-    save_state(state)
-
-    # ---------------------------------------------------------------------------
-    # Set up notifier
-    # ---------------------------------------------------------------------------
-    from notifications import create_notifier
-
-    notifier = create_notifier(config)
-    if not live_trading:
-        notifier(
-            f"⚠️ PAPER MODE ACTIVE — no real orders will be placed\n"
-            f"Paper equity: ${state.get('paper_equity', 10000):.2f}\n"
-            f"Started: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-        )
-
-    # ---------------------------------------------------------------------------
-    # Set leverage for all symbols (live mode only)
-    # ---------------------------------------------------------------------------
-    if live_trading:
-        for symbol in SYMBOLS:
-            try:
-                setup_futures_leverage(client, symbol, int(MIN_LEVERAGE))
-            except Exception as exc:
-                logger.warning("[%s] Failed to set leverage: %s", symbol, exc)
-
-    # ---------------------------------------------------------------------------
-    # Initial regime check
-    # ---------------------------------------------------------------------------
-    from strategy.regime_filter import update_regime
-
-    logger.info("Running initial regime check...")
-    try:
-        update_regime(client, state, notifier=notifier)
-        save_state(state)
-        logger.info("Initial regime: %s", state.get("btc_regime", "UNKNOWN"))
-    except Exception as exc:
-        logger.error("Initial regime check failed: %s — defaulting to BEAR", exc)
-        state["btc_regime"] = state.get("btc_regime", "BEAR")
-
-    # ---------------------------------------------------------------------------
-    # Portfolio
-    # ---------------------------------------------------------------------------
-    from execution.order_manager import place_market_order, place_stop_loss_order, place_limit_tp_order
-    from strategy.portfolio import Portfolio
-
-    portfolio = Portfolio(
-        client=client,
-        state=state,
-        config=config,
-        notifier=notifier,
-    )
-
-    # ---------------------------------------------------------------------------
-    # APScheduler setup
-    # ---------------------------------------------------------------------------
-    from apscheduler.schedulers.background import BackgroundScheduler
-    from apscheduler.triggers.cron import CronTrigger
-    from apscheduler.triggers.interval import IntervalTrigger
+    refresh_regime()
 
     scheduler = BackgroundScheduler(timezone="UTC")
-
-    def scheduled_regime_update():
-        logger.info("Scheduled regime update triggered (00:05 UTC)")
-        try:
-            update_regime(client, state, notifier=notifier)
-            save_state(state)
-        except Exception as exc:
-            logger.error("Scheduled regime update failed: %s", exc)
-
-    scheduler.add_job(
-        scheduled_regime_update,
-        CronTrigger(hour=config["regime_check_hour"], minute=config["regime_check_minute"], timezone="UTC"),
-        id="regime_update",
-        name="Daily Regime Update",
-    )
-
+    scheduler.add_job(refresh_regime, "cron", hour=0, minute=5, id="regime")
+    scheduler.add_job(lambda: logger.info("Keepalive"), "interval", minutes=30, id="keepalive")
     scheduler.start()
-    logger.info("APScheduler started (regime update at %02d:%02d UTC)",
-                config["regime_check_hour"], config["regime_check_minute"])
 
-    # ---------------------------------------------------------------------------
-    # WebSocket subscription
-    # ---------------------------------------------------------------------------
-    from binance import ThreadedWebsocketManager
+    ws_app = start_websocket(portfolio, lambda: portfolio.state.get("btc_regime", "BULL"))
 
-    twm = ThreadedWebsocketManager(
-        api_key=os.environ.get("BINANCE_API_KEY", ""),
-        api_secret=os.environ.get("BINANCE_API_SECRET", ""),
-        testnet=testnet,
-    )
-    twm.start()
-
-    ws_reconnect_backoff = 1
-    MAX_WS_BACKOFF = 60
-
-    def on_kline_message(msg):
-        """Handle incoming kline WebSocket messages."""
-        nonlocal ws_reconnect_backoff
-
-        if msg.get("e") == "error":
-            logger.error("WebSocket error: %s", msg)
-            return
-
-        kline = msg.get("k", {})
-        symbol = msg.get("s", "")
-        is_closed = kline.get("x", False)
-        current_price = float(kline.get("c", 0))
-
-        if is_closed:
-            logger.info("[%s] 4H candle closed at %.4f", symbol, current_price)
-            try:
-                portfolio.run_signal_cycle()
-                portfolio.run_exit_cycle(symbol, current_price)
-                save_state(state)
-            except Exception as exc:
-                logger.error("[%s] Signal/exit cycle error: %s", symbol, exc, exc_info=True)
-        else:
-            # Intracandle: update trailing stops with current price
-            try:
-                portfolio.run_exit_cycle(symbol, current_price)
-            except Exception as exc:
-                logger.debug("[%s] Exit cycle update error: %s", symbol, exc)
-
-    # Subscribe to 4H kline streams for all symbols
-    stream_keys = []
-    for symbol in SYMBOLS:
-        try:
-            key = twm.start_futures_kline_socket(
-                callback=on_kline_message,
-                symbol=symbol.lower(),
-                interval="4h",
-            )
-            stream_keys.append(key)
-            logger.info("[%s] WebSocket subscribed (4H klines)", symbol)
-        except Exception as exc:
-            logger.error("[%s] Failed to subscribe to WebSocket: %s", symbol, exc)
-
-    # ---------------------------------------------------------------------------
-    # Main loop
-    # ---------------------------------------------------------------------------
-    logger.info("Strategy running. Press Ctrl+C to stop.")
     try:
         while True:
-            time.sleep(60)
-            # Log periodic status
-            equity = portfolio.get_account_equity()
-            open_pos = list(state.get("open_positions", {}).keys())
-            logger.debug(
-                "Status: equity=$%.2f | open=%s | regime=%s",
-                equity, open_pos or "none", state.get("btc_regime", "UNKNOWN"),
-            )
+            time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Shutdown requested by user...")
+        logger.info("Shutting down...")
     finally:
-        try:
-            twm.stop()
-        except Exception:
-            pass
-        try:
-            scheduler.shutdown(wait=False)
-        except Exception:
-            pass
-        save_state(state)
-        logger.info("Strategy stopped cleanly.")
+        scheduler.shutdown(wait=False)
+        ws_app.close()
 
 
 if __name__ == "__main__":
