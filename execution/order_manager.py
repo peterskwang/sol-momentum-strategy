@@ -151,7 +151,75 @@ class OrderManager:
 
 
 def notify_trade_open(
-     *,
-     symbol: str,
-@@
- }
+    *,
+    symbol: str,
+    entry_price: float,
+    qty: float,
+    notional: float,
+    stop_price: float,
+    risk_dollars: float,
+    tp1_price: float,
+    regime: str,
+    funding_rate: float,
+    funding_boost: float,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """Send the standardized trade-open Telegram alert."""
+
+    return send_trade_open_alert(
+        symbol=symbol,
+        price=entry_price,
+        qty=qty,
+        notional=notional,
+        stop=stop_price,
+        risk=risk_dollars,
+        tp1=tp1_price,
+        regime=regime,
+        funding_rate=funding_rate,
+        funding_boost=funding_boost,
+        logger=logger,
+    )
+
+
+def notify_tp1_hit(
+    *,
+    symbol: str,
+    tp1_price: float,
+    realized_pnl: float,
+    remaining_qty: float,
+    base_asset: str | None = None,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """Send the TP1 fill alert."""
+
+    return send_tp1_hit_alert(
+        symbol=symbol,
+        tp1=tp1_price,
+        pnl=realized_pnl,
+        remaining_qty=remaining_qty,
+        base_asset=base_asset,
+        logger=logger,
+    )
+
+
+def notify_trade_closed(
+    *,
+    symbol: str,
+    exit_price: float,
+    reason: str,
+    realized_pnl: float,
+    pct_return: float,
+    hold_hours: float,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """Send the trade closed alert."""
+
+    return send_trade_closed_alert(
+        symbol=symbol,
+        price=exit_price,
+        reason=reason,
+        pnl=realized_pnl,
+        pct=pct_return,
+        hold_hours=hold_hours,
+        logger=logger,
+    )

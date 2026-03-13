@@ -36,11 +36,12 @@ class Portfolio:
         state_path: Path,
         logger: logging.Logger | None = None,
         live_trading: bool = False,
+        paper_mode: bool | None = None,
     ) -> None:
         self.client = client
         self.state_path = state_path
         self.logger = logger or logging.getLogger(__name__)
-        self.live_trading = live_trading
+        self.live_trading = live_trading if paper_mode is None else not paper_mode
         self.order_manager = OrderManager(client=self.client, live_trading=self.live_trading)
         self.state = self._load_state()
 
