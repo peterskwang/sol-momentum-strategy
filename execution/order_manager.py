@@ -94,3 +94,67 @@ def cancel_order(client: Any, symbol: str, order_id: str, paper_mode: bool = Tru
         return client.futures_cancel_order(symbol=symbol, orderId=order_id)
 
     return api_call_with_retry(_call)
+
+
+class OrderManager:
+    """Manages order placement with live_trading injected at construction.
+
+    This is the authoritative source for whether orders are live or paper.
+    The ``live_trading`` flag is set once at startup and never read from env
+    again, so a stale ``LIVE_TRADING`` env var cannot silently override the
+    ``--live`` CLI flag.
+    """
+
+    def __init__(self, client: Any, live_trading: bool = False) -> None:
+        self.client = client
+        self.live_trading = live_trading  # source of truth, set at startup
+
+    @property
+    def _paper(self) -> bool:
+        return not self.live_trading
+
+    def place_market_order(self, symbol: str, side: str, quantity: float) -> dict[str, Any]:
+        return place_market_order(
+            self.client, symbol=symbol, side=side, quantity=quantity, paper_mode=self._paper
+        )
+
+    def place_stop_loss_order(
+        self, symbol: str, side: str, stop_price: float, quantity: float
+    ) -> dict[str, Any]:
+        return place_stop_loss_order(
+            self.client,
+            symbol=symbol,
+            side=side,
+            stop_price=stop_price,
+            quantity=quantity,
+            paper_mode=self._paper,
+        )
+
+    def place_limit_tp_order(
+        self, symbol: str, side: str, price: float, quantity: float
+    ) -> dict[str, Any]:
+        return place_limit_tp_order(
+            self.client,
+            symbol=symbol,
+            side=side,
+            price=price,
+            quantity=quantity,
+            paper_mode=self._paper,
+        )
+
+    def place_trailing_stop_order(
+        self, symbol: str, side: str, callback_rate: float, quantity: float
+    ) -> dict[str, Any]:
+        return place_trailing_stop_order(
+            self.client,
+            symbol=symbol,
+            side=side,
+            callback_rate=callback_rate,
+            quantity=quantity,
+            paper_mode=self._paper,
+        )
+
+    def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
+        return cancel_order(
+            self.client, symbol=symbol, order_id=order_id, paper_mode=self._paper
+        )

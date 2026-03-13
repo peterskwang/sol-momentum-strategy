@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from binance import ThreadedWebsocketManager
 from websocket import WebSocketApp
 
 from config import MAX_LEVERAGE, SYMBOLS, load_config
@@ -42,7 +43,7 @@ def ensure_state_file() -> None:
         }, indent=2))
 
 
-def start_websocket(portfolio: Portfolio, btc_regime_getter) -> WebSocketApp:
+def start_market_websocket(portfolio: Portfolio, btc_regime_getter) -> WebSocketApp:
     streams = ["solusdt@kline_4h", "ethusdt@kline_4h", "avaxusdt@kline_4h"]
     url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
 
@@ -60,6 +61,53 @@ def start_websocket(portfolio: Portfolio, btc_regime_getter) -> WebSocketApp:
     return ws_app
 
 
+def start_user_data_stream(
+    portfolio: Portfolio,
+    twm: ThreadedWebsocketManager,
+    logger: logging.Logger,
+) -> None:
+    """Subscribe to Binance Futures user data stream to receive fill events.
+
+    Wires ORDER_TRADE_UPDATE messages into portfolio.handle_fill_event so that
+    TP1 → trailing-stop transitions happen immediately on fill rather than being
+    discovered only at the next 4H close.  Also prevents redundant reduceOnly
+    market sells after Binance's STOP_MARKET already fired.
+    """
+
+    def on_user_data_message(msg: dict[str, Any]) -> None:
+        event_type = msg.get("e")
+        if event_type != "ORDER_TRADE_UPDATE":
+            return
+        order_status = msg.get("o", {})
+        if order_status.get("X") != "FILLED":
+            return
+
+        symbol = order_status.get("s")
+        order_id = order_status.get("i")
+        order_type = order_status.get("o")
+        fill_price = float(order_status.get("ap", 0) or 0)
+
+        logger.info(
+            "User data fill event: symbol=%s order_id=%s type=%s fill_price=%.4f",
+            symbol,
+            order_id,
+            order_type,
+            fill_price,
+        )
+        try:
+            portfolio.handle_fill_event(
+                symbol=symbol,
+                order_id=order_id,
+                order_type=order_type,
+                fill_price=fill_price,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("handle_fill_event error for %s: %s", symbol, exc)
+
+    twm.start_futures_user_socket(callback=on_user_data_message)
+    logger.info("User data stream subscribed")
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config()
@@ -67,6 +115,9 @@ def main() -> None:
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
     logger = logging.getLogger("run_live")
 
+    # live_trading is the single source of truth — both the env flag AND --live
+    # must agree.  This resolved bool is injected into Portfolio/OrderManager so
+    # the LIVE_TRADING env var is never re-read after startup.
     live_enabled = cfg.live_trading and args.live
     paper_mode = not live_enabled
 
@@ -83,7 +134,12 @@ def main() -> None:
     for symbol in SYMBOLS:
         setup_futures_leverage(client, symbol, int(MAX_LEVERAGE), logger=logger)
 
-    portfolio = Portfolio(client=client, state_path=STATE_PATH, logger=logger, paper_mode=paper_mode)
+    portfolio = Portfolio(
+        client=client,
+        state_path=STATE_PATH,
+        logger=logger,
+        live_trading=live_enabled,
+    )
 
     def refresh_regime() -> str:
         state = portfolio.state
@@ -98,7 +154,12 @@ def main() -> None:
     scheduler.add_job(lambda: logger.info("Keepalive"), "interval", minutes=30, id="keepalive")
     scheduler.start()
 
-    ws_app = start_websocket(portfolio, lambda: portfolio.state.get("btc_regime", "BULL"))
+    # ThreadedWebsocketManager handles user data stream (fill events)
+    twm = ThreadedWebsocketManager(api_key=cfg.api_key, api_secret=cfg.api_secret, testnet=args.testnet)
+    twm.start()
+    start_user_data_stream(portfolio, twm, logger)
+
+    ws_app = start_market_websocket(portfolio, lambda: portfolio.state.get("btc_regime", "BULL"))
 
     try:
         while True:
@@ -107,6 +168,7 @@ def main() -> None:
         logger.info("Shutting down...")
     finally:
         scheduler.shutdown(wait=False)
+        twm.stop()
         ws_app.close()
 
 
