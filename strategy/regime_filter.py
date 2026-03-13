@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List
 import pandas as pd
 
 from config import BTC_EMA_FAST, BTC_EMA_SLOW, BTC_SYMBOL
+from utils.telegram import send_error_alert, send_regime_change_alert
 
 REGIME_BULL = "BULL"
 REGIME_BEAR = "BEAR"
@@ -63,6 +64,7 @@ def update_regime(
     """Update BTC regime with retries and backoff."""
 
     attempt = 0
+    previous_regime = state.get("btc_regime")
     while True:
         try:
             df = fetch_btc_daily_klines(client)
@@ -70,11 +72,20 @@ def update_regime(
             state["btc_regime"] = regime
             if logger:
                 logger.info("BTC regime updated to %s", regime)
+            if previous_regime and previous_regime != regime:
+                send_regime_change_alert(regime, logger=logger)
             return regime
         except Exception as exc:  # noqa: BLE001
             attempt += 1
             if logger:
                 logger.warning("Failed to update regime (attempt %s/%s): %s", attempt, max_retries, exc)
+            action = "Retrying after backoff" if attempt < max_retries else "Giving up"
+            send_error_alert(
+                component="RegimeFilter",
+                error=str(exc),
+                action=action,
+                logger=logger,
+            )
             if attempt >= max_retries:
                 raise
             time.sleep(backoff_seconds * attempt)

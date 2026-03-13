@@ -1,9 +1,15 @@
 """Order placement helpers."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from execution.binance_client import api_call_with_retry
+from utils.telegram import (
+    send_trade_closed_alert,
+    send_trade_open_alert,
+    send_tp1_hit_alert,
+)
 
 
 def _paper_order_response(**kwargs: Any) -> dict[str, Any]:
@@ -97,30 +103,20 @@ def cancel_order(client: Any, symbol: str, order_id: str, paper_mode: bool = Tru
 
 
 class OrderManager:
-    """Manages order placement with live_trading injected at construction.
-
-    This is the authoritative source for whether orders are live or paper.
-    The ``live_trading`` flag is set once at startup and never read from env
-    again, so a stale ``LIVE_TRADING`` env var cannot silently override the
-    ``--live`` CLI flag.
-    """
+    """Manages order placement with live_trading injected at construction."""
 
     def __init__(self, client: Any, live_trading: bool = False) -> None:
         self.client = client
-        self.live_trading = live_trading  # source of truth, set at startup
+        self.live_trading = live_trading
 
     @property
     def _paper(self) -> bool:
         return not self.live_trading
 
     def place_market_order(self, symbol: str, side: str, quantity: float) -> dict[str, Any]:
-        return place_market_order(
-            self.client, symbol=symbol, side=side, quantity=quantity, paper_mode=self._paper
-        )
+        return place_market_order(self.client, symbol=symbol, side=side, quantity=quantity, paper_mode=self._paper)
 
-    def place_stop_loss_order(
-        self, symbol: str, side: str, stop_price: float, quantity: float
-    ) -> dict[str, Any]:
+    def place_stop_loss_order(self, symbol: str, side: str, stop_price: float, quantity: float) -> dict[str, Any]:
         return place_stop_loss_order(
             self.client,
             symbol=symbol,
@@ -130,9 +126,7 @@ class OrderManager:
             paper_mode=self._paper,
         )
 
-    def place_limit_tp_order(
-        self, symbol: str, side: str, price: float, quantity: float
-    ) -> dict[str, Any]:
+    def place_limit_tp_order(self, symbol: str, side: str, price: float, quantity: float) -> dict[str, Any]:
         return place_limit_tp_order(
             self.client,
             symbol=symbol,
@@ -142,9 +136,7 @@ class OrderManager:
             paper_mode=self._paper,
         )
 
-    def place_trailing_stop_order(
-        self, symbol: str, side: str, callback_rate: float, quantity: float
-    ) -> dict[str, Any]:
+    def place_trailing_stop_order(self, symbol: str, side: str, callback_rate: float, quantity: float) -> dict[str, Any]:
         return place_trailing_stop_order(
             self.client,
             symbol=symbol,
@@ -155,6 +147,11 @@ class OrderManager:
         )
 
     def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
-        return cancel_order(
-            self.client, symbol=symbol, order_id=order_id, paper_mode=self._paper
-        )
+        return cancel_order(self.client, symbol=symbol, order_id=order_id, paper_mode=self._paper)
+
+
+def notify_trade_open(
+     *,
+     symbol: str,
+@@
+ }

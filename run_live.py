@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from binance import ThreadedWebsocketManager
@@ -17,8 +17,131 @@ from config import MAX_LEVERAGE, SYMBOLS, load_config
 from execution.binance_client import create_client, setup_futures_leverage
 from strategy.portfolio import Portfolio
 from strategy.regime_filter import update_regime
+from utils.state import save_state
+from utils.telegram import (
+    send_error_alert,
+    send_startup_alert,
+    send_websocket_fallback_alert,
+)
 
 STATE_PATH = Path("state/strategy_state.json")
+STREAMS = ["solusdt@kline_4h", "ethusdt@kline_4h", "avaxusdt@kline_4h"]
+
+
+class WebSocketController:
+    """Manage Binance kline WebSocket connectivity with reconnect/fallback logic."""
+
+    def __init__(
+        self,
+        portfolio: Portfolio,
+        regime_getter: Callable[[], str],
+        logger: logging.Logger,
+        fallback_callback: Callable[[], None],
+    ) -> None:
+        self.portfolio = portfolio
+        self.regime_getter = regime_getter
+        self.logger = logger
+        self.fallback_callback = fallback_callback
+        self._thread: threading.Thread | None = None
+        self._ws_app: WebSocketApp | None = None
+        self._stop_event = threading.Event()
+        self._force_refresh = threading.Event()
+        self._fallback_triggered = False
+        self._reconnect_attempts = 0
+        self._max_attempts = 5
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._ws_app:
+            self._ws_app.close()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def request_refresh(self) -> None:
+        if self._ws_app:
+            self._force_refresh.set()
+            self._ws_app.close()
+
+    def _run_loop(self) -> None:
+        while not self._stop_event.is_set() and not self._fallback_triggered:
+            self._ws_app = self._create_app()
+            self._ws_app.run_forever()
+
+            if self._stop_event.is_set():
+                break
+
+            if self._force_refresh.is_set():
+                self.logger.info("WebSocket proactive refresh completed")
+                self._force_refresh.clear()
+                self._reconnect_attempts = 0
+                continue
+
+            self._reconnect_attempts += 1
+            if self._reconnect_attempts > self._max_attempts:
+                self.logger.error("Max WebSocket reconnect attempts exceeded; enabling REST fallback")
+                self._fallback_triggered = True
+                self.fallback_callback()
+                send_websocket_fallback_alert(logger=self.logger)
+                send_error_alert(
+                    component="WebSocket",
+                    error="Failed to reconnect after 5 attempts",
+                    action="Switching to REST polling (4h)",
+                    logger=self.logger,
+                )
+                break
+
+            delay = min(16, 2 ** (self._reconnect_attempts - 1))
+            self.logger.warning(
+                "WebSocket reconnect attempt %s/%s in %ss",
+                self._reconnect_attempts,
+                self._max_attempts,
+                delay,
+            )
+            time.sleep(delay)
+
+    def _create_app(self) -> WebSocketApp:
+        url = f"wss://fstream.binance.com/stream?streams={'/'.join(STREAMS)}"
+
+        def on_message(_: Any, message: str) -> None:
+            try:
+                data = json.loads(message)
+                candle = data.get("data", {}).get("k", {})
+                if candle.get("x"):
+                    regime = self.regime_getter()
+                    self.portfolio.run_signal_cycle(regime)
+                    self.portfolio.run_exit_cycle()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.exception("WebSocket message handling failed: %s", exc)
+
+        def on_open(_: Any) -> None:
+            self.logger.info("WebSocket connected")
+            self._reconnect_attempts = 0
+
+        def on_error(_: Any, error: Exception) -> None:
+            self.logger.error("WebSocket error: %s", error)
+            send_error_alert(
+                component="WebSocket",
+                error=str(error),
+                action="Retrying connection",
+                logger=self.logger,
+            )
+
+        def on_close(_: Any, status_code: int, msg: str) -> None:
+            self.logger.warning("WebSocket closed (%s, %s)", status_code, msg)
+
+        return WebSocketApp(
+            url,
+            on_message=on_message,
+            on_open=on_open,
+            on_error=on_error,
+            on_close=on_close,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,34 +154,19 @@ def parse_args() -> argparse.Namespace:
 
 def ensure_state_file() -> None:
     if not STATE_PATH.exists():
-        STATE_PATH.write_text(json.dumps({
-            "version": "1.0",
-            "btc_regime": "BULL",
-            "open_positions": {},
-            "closed_trades": [],
-            "paper_mode": True,
-            "paper_equity": 10000.0,
-            "paper_pnl": 0.0,
-            "lot_size_cache": {},
-        }, indent=2))
-
-
-def start_market_websocket(portfolio: Portfolio, btc_regime_getter) -> WebSocketApp:
-    streams = ["solusdt@kline_4h", "ethusdt@kline_4h", "avaxusdt@kline_4h"]
-    url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
-
-    def on_message(_: Any, message: str) -> None:
-        data = json.loads(message)
-        candle = data.get("data", {}).get("k", {})
-        if candle.get("x"):
-            regime = btc_regime_getter()
-            portfolio.run_signal_cycle(regime)
-            portfolio.run_exit_cycle()
-
-    ws_app = WebSocketApp(url, on_message=on_message)
-    thread = threading.Thread(target=ws_app.run_forever, daemon=True)
-    thread.start()
-    return ws_app
+        save_state(
+            {
+                "version": "1.0",
+                "btc_regime": "BULL",
+                "open_positions": {},
+                "closed_trades": [],
+                "paper_mode": True,
+                "paper_equity": 10000.0,
+                "paper_pnl": 0.0,
+                "lot_size_cache": {},
+            },
+            STATE_PATH,
+        )
 
 
 def start_user_data_stream(
@@ -66,13 +174,7 @@ def start_user_data_stream(
     twm: ThreadedWebsocketManager,
     logger: logging.Logger,
 ) -> None:
-    """Subscribe to Binance Futures user data stream to receive fill events.
-
-    Wires ORDER_TRADE_UPDATE messages into portfolio.handle_fill_event so that
-    TP1 → trailing-stop transitions happen immediately on fill rather than being
-    discovered only at the next 4H close.  Also prevents redundant reduceOnly
-    market sells after Binance's STOP_MARKET already fired.
-    """
+    """Subscribe to Binance Futures user data stream to receive fill events."""
 
     def on_user_data_message(msg: dict[str, Any]) -> None:
         event_type = msg.get("e")
@@ -115,12 +217,7 @@ def main() -> None:
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO))
     logger = logging.getLogger("run_live")
 
-    # live_trading is the single source of truth — both the env flag AND --live
-    # must agree.  This resolved bool is injected into Portfolio/OrderManager so
-    # the LIVE_TRADING env var is never re-read after startup.
     live_enabled = cfg.live_trading and args.live
-    paper_mode = not live_enabled
-
     if live_enabled and (not cfg.api_key or not cfg.api_secret):
         raise RuntimeError("Live trading requires API credentials")
 
@@ -128,6 +225,7 @@ def main() -> None:
     logger.info("Starting strategy in %s mode", mode_label)
 
     ensure_state_file()
+    send_startup_alert(mode_label, logger=logger)
 
     client = create_client(cfg.api_key, cfg.api_secret, testnet=args.testnet)
 
@@ -152,14 +250,40 @@ def main() -> None:
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(refresh_regime, "cron", hour=0, minute=5, id="regime")
     scheduler.add_job(lambda: logger.info("Keepalive"), "interval", minutes=30, id="keepalive")
+
+    rest_polling_enabled = False
+
+    def run_rest_cycle() -> None:
+        regime = portfolio.state.get("btc_regime", "BULL")
+        portfolio.run_signal_cycle(regime)
+        portfolio.run_exit_cycle()
+
+    def enable_rest_polling() -> None:
+        nonlocal rest_polling_enabled
+        if rest_polling_enabled:
+            return
+        scheduler.add_job(run_rest_cycle, "interval", hours=4, id="rest_fallback", replace_existing=True)
+        rest_polling_enabled = True
+        run_rest_cycle()
+
+    ws_controller = WebSocketController(
+        portfolio=portfolio,
+        regime_getter=lambda: portfolio.state.get("btc_regime", "BULL"),
+        logger=logger,
+        fallback_callback=enable_rest_polling,
+    )
+    ws_controller.start()
+
+    scheduler.add_job(ws_controller.request_refresh, "interval", hours=23, minutes=50, id="ws_refresh")
     scheduler.start()
 
-    # ThreadedWebsocketManager handles user data stream (fill events)
-    twm = ThreadedWebsocketManager(api_key=cfg.api_key, api_secret=cfg.api_secret, testnet=args.testnet)
-    twm.start()
-    start_user_data_stream(portfolio, twm, logger)
-
-    ws_app = start_market_websocket(portfolio, lambda: portfolio.state.get("btc_regime", "BULL"))
+    twm: ThreadedWebsocketManager | None = None
+    if cfg.api_key and cfg.api_secret:
+        twm = ThreadedWebsocketManager(api_key=cfg.api_key, api_secret=cfg.api_secret, testnet=args.testnet)
+        twm.start()
+        start_user_data_stream(portfolio, twm, logger)
+    else:
+        logger.warning("Skipping user data stream subscription (missing API credentials)")
 
     try:
         while True:
@@ -167,9 +291,10 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
+        ws_controller.stop()
         scheduler.shutdown(wait=False)
-        twm.stop()
-        ws_app.close()
+        if twm:
+            twm.stop()
 
 
 if __name__ == "__main__":
