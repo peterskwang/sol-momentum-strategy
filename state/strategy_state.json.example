@@ -1,0 +1,12 @@
+{
+  "version": "1.0",
+  "updated_at": "2026-03-13T00:00:00Z",
+  "btc_regime": "BULL",
+  "regime_updated_at": "2026-03-13T00:05:00Z",
+  "open_positions": {},
+  "closed_trades": [],
+  "paper_mode": true,
+  "paper_equity": 10000.0,
+  "paper_pnl": 0.0,
+  "lot_size_cache": {}
+}
