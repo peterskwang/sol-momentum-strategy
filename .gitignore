@@ -1,0 +1,60 @@
+# Secrets
+secrets/
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/*.log
+
+# State (should not be committed in production)
+state/strategy_state.json
+
+# Backtest data cache
+backtest/data/*.csv
+backtest/data/*.parquet
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
